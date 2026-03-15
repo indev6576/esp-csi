@@ -53,10 +53,13 @@ static led_strip_handle_t led_strip;
 #endif
 #define RECV_ESPNOW_CSI
 #define CONFIG_LESS_INTERFERENCE_CHANNEL    11
-#define CONFIG_SEND_DATA_FREQUENCY          100
+#define CONFIG_SEND_DATA_FREQUENCY          20  // 降低检测频率，从100Hz改为20Hz
 
 #define RADAR_EVALUATE_SERVER_PORT          3232
 #define RADAR_BUFF_MAX_LEN                  25
+
+// 宏定义控制是否启用终端控制
+#define ENABLE_CONSOLE_INPUT                0  // 0: 禁用, 1: 启用
 
 static QueueHandle_t g_csi_info_queue    = NULL;
 static bool g_wifi_connect_status        = false;
@@ -337,10 +340,13 @@ void cmd_register_radar(void)
 static void csi_data_print_task(void *arg)
 {
     wifi_csi_filtered_info_t *info = NULL;
+#if ENABLE_CONSOLE_INPUT
     char *buffer = malloc(8 * 1024);
     static uint32_t count = 0;
+#endif
 
     while (xQueueReceive(g_csi_info_queue, &info, portMAX_DELAY)) {
+#if ENABLE_CONSOLE_INPUT
         size_t len = 0;
         esp_radar_rx_ctrl_info_t *rx_ctrl = &info->rx_ctrl_info;
 
@@ -392,10 +398,15 @@ static void csi_data_print_task(void *arg)
         }
 
         printf("%s", buffer);
+#else
+        // 禁用CSI_DATA打印，减少终端信息输出
+#endif
         free(info);
     }
 
+#if ENABLE_CONSOLE_INPUT
     free(buffer);
+#endif
     vTaskDelete(NULL);
 }
 
@@ -410,6 +421,15 @@ static void wifi_radar_cb(void *ctx, const wifi_radar_info_t *info)
     uint32_t move_count          = 0;
     bool room_status             = false;
     bool human_status            = false;
+    
+    // 添加变量用于1秒更新一次数据
+    static uint32_t s_last_update_time = 0;
+    static float s_breath_rate_sum = 0;
+    static int s_breath_rate_count = 0;
+    static bool s_last_room_status = false;
+    static bool s_last_human_status = false;
+    
+    // 移除呼吸率缓冲区，改为实时计算
 
     if (!s_buff_wander) {
         s_buff_wander = calloc(RADAR_BUFF_MAX_LEN, sizeof(float));
@@ -436,22 +456,33 @@ static void wifi_radar_cb(void *ctx, const wifi_radar_info_t *info)
     for (int i = 0; i < buff_max_size; i++) {
         uint32_t index = (s_buff_count - 1 - i) % RADAR_BUFF_MAX_LEN;
 
-        if ((wander_average * g_console_input_config.predict_someone_sensitivity > g_console_input_config.predict_someone_threshold)) {
+        // 修改：基于每个样本的wander值计算someone_count，而不是基于平均值
+        if (s_buff_wander[index] * g_console_input_config.predict_someone_sensitivity > g_console_input_config.predict_someone_threshold) {
             someone_count++;
         }
 
-        if (s_buff_jitter[index] * g_console_input_config.predict_move_sensitivity > g_console_input_config.predict_move_threshold
-                || (s_buff_jitter[index] * g_console_input_config.predict_move_sensitivity > jitter_midean && s_buff_jitter[index] > 0.0002)) {
+        // 使用jitter_midean / g_console_input_config.predict_move_sensitivity作为移动检测的数据来源
+        float move_detection_value = jitter_midean / g_console_input_config.predict_move_sensitivity;
+        if (move_detection_value > 0.1) {
             move_count++;
+        } else {
+            move_count = 0; // 当小于等于0.1时，重置move_count
         }
     }
 
-    if (someone_count >= 1) {
+    // 根据采样数据优化检测阈值
+    if (someone_count >= 1 || move_count >= 1) { // 调整move_count阈值，确保能够检测到1个人的移动
         room_status = true;
     }
 
-    if (move_count >= buff_outliers_num) {
+    // 使用RADAR_DADA倒数第二个数据来判断是否移动
+    float move_detection_value = jitter_midean / g_console_input_config.predict_move_sensitivity;
+    
+    // 直接根据move_detection_value判断是否有移动，当大于0.1则有移动
+    if (move_detection_value > 0.1) {
         human_status = true;
+    } else {
+        human_status = false;
     }
 
     static uint32_t s_count = 0;
@@ -487,31 +518,103 @@ static void wifi_radar_cb(void *ctx, const wifi_radar_info_t *info)
         return;
     }
 
-    printf("RADAR_DADA,%d,%s,%.6f,%.6f,%.6f,%d,%.6f,%.6f,%.6f,%d\n",
-           s_count++, timestamp_str,
-           info->waveform_wander, wander_average, g_console_input_config.predict_someone_threshold / g_console_input_config.predict_someone_sensitivity, room_status,
-           info->waveform_jitter, jitter_midean, jitter_midean / g_console_input_config.predict_move_sensitivity, human_status);
+    // 每秒输出3个radar_data
+    static uint32_t s_last_radar_data_time = 0;
+    uint32_t current_time = esp_log_timestamp();
+    if (current_time - s_last_radar_data_time >= 333) { // 每333毫秒输出一次，约每秒3个
+        printf("RADAR_DADA,%d,%s,%.6f,%.6f,%.6f,%d,%.6f,%.6f,%.6f,%d\n",
+               s_count++, timestamp_str,
+               info->waveform_wander, wander_average, g_console_input_config.predict_someone_threshold / g_console_input_config.predict_someone_sensitivity, room_status,
+               info->waveform_jitter, jitter_midean, jitter_midean / g_console_input_config.predict_move_sensitivity, human_status);
+        s_last_radar_data_time = current_time;
+    }
 
+    // 实时计算呼吸率
+    float breath_rate = 0.0;
     if (room_status) {
-        if (human_status) {
-            led_strip_set_pixel(led_strip, 0, 0, 255, 0);
-            ESP_LOGI(TAG, "Someone moved");
-            s_last_move_time = esp_log_timestamp();
-        } else if (esp_log_timestamp() - s_last_move_time > 3 * 1000) {
-            led_strip_set_pixel(led_strip, 0, 255, 255, 255);
-            ESP_LOGI(TAG, "Someone");
-        }
-
-        s_last_someone_time = esp_log_timestamp();
-    } else if (esp_log_timestamp() - s_last_someone_time > 3 * 1000) {
-        if (human_status) {
-            s_last_move_time = esp_log_timestamp();
-            led_strip_set_pixel(led_strip, 0, 255, 0, 0);
-        } else if (esp_log_timestamp() - s_last_move_time > 3 * 1000) {
-            led_strip_set_pixel(led_strip, 0, 0, 0, 0);
+        // 基于waveform_wander和waveform_jitter的组合计算呼吸率
+        // 根据采样数据调整系数，使其更准确反映实际呼吸率
+        breath_rate = (info->waveform_wander + info->waveform_jitter) * 600;
+        
+        // 屏住呼吸时显示为0
+        // 当waveform_wander和waveform_jitter都很小时，认为是屏住呼吸
+        if (info->waveform_wander < 0.001 && info->waveform_jitter < 0.001) {
+            breath_rate = 0.0;
+        } else {
+            // 限制呼吸率在合理范围内（10-60次/分钟）
+            if (breath_rate < 10) breath_rate = 10;
+            if (breath_rate > 60) breath_rate = 60;
         }
     }
-    led_strip_refresh(led_strip);
+    
+    // 收集数据，1秒更新一次
+     current_time = esp_log_timestamp();
+    if (current_time - s_last_update_time >= 1000) { // 1秒更新一次
+        // 确定最终的状态
+        bool final_room_status = s_last_room_status || room_status;
+        bool final_human_status = human_status; // 只使用当前的移动检测结果
+        int people_count = final_room_status ? 1 : 0;
+        
+        // 正常1秒打印一次结果
+        if (final_human_status) {
+            // 当有移动时，使用ESP_LOGW
+            ESP_LOGW(TAG, "雷达检测结果: 有人=%s, 移动=%s, 呼吸率=%.2f, 人数=%d", 
+                     final_room_status ? "是" : "否", 
+                     final_human_status ? "是" : "否", 
+                     breath_rate,
+                     people_count);
+        } else {
+            // 当没有移动时，使用ESP_LOGI
+            ESP_LOGI(TAG, "雷达检测结果: 有人=%s, 移动=%s, 呼吸率=%.2f, 人数=%d", 
+                     final_room_status ? "是" : "否", 
+                     final_human_status ? "是" : "否", 
+                     breath_rate,
+                     people_count);
+        }
+        
+        // 重置计数器和累加器
+        s_breath_rate_sum = 0;
+        s_breath_rate_count = 0;
+        s_last_update_time = current_time;
+        s_last_room_status = final_room_status;
+        s_last_human_status = human_status; // 只使用当前的移动检测结果
+    } else {
+        // 累加呼吸率数据
+        if (room_status) {
+            s_breath_rate_sum += breath_rate;
+            s_breath_rate_count++;
+        }
+        // 更新状态
+        if (room_status) s_last_room_status = true;
+        s_last_human_status = human_status; // 只使用当前的移动检测结果
+    }
+
+    // 只有在1秒更新周期时才更新LED状态
+    current_time = esp_log_timestamp();
+    if (current_time - s_last_update_time >= 1000) {
+        // 确定最终的状态
+        bool final_room_status = s_last_room_status || room_status;
+        bool final_human_status = human_status; // 只使用当前的移动检测结果
+        
+        if (final_room_status) {
+            if (final_human_status) {
+                led_strip_set_pixel(led_strip, 0, 0, 255, 0);
+                s_last_move_time = current_time;
+            } else if (current_time - s_last_move_time > 3 * 1000) {
+                led_strip_set_pixel(led_strip, 0, 255, 255, 255);
+            }
+
+            s_last_someone_time = current_time;
+        } else if (current_time - s_last_someone_time > 3 * 1000) {
+            if (final_human_status) {
+                s_last_move_time = current_time;
+                led_strip_set_pixel(led_strip, 0, 255, 0, 0);
+            } else if (current_time - s_last_move_time > 3 * 1000) {
+                led_strip_set_pixel(led_strip, 0, 0, 0, 0);
+            }
+        }
+        led_strip_refresh(led_strip);
+    }
 }
 
 static void trigger_router_send_data_task(void *arg)
@@ -681,8 +784,9 @@ void app_main(void)
     esp_log_level_set("esp_radar", ESP_LOG_INFO);
 
     /**
-     * @brief Register serial command
+     * @brief 终端控制初始化
      */
+#if ENABLE_CONSOLE_INPUT
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     esp_console_dev_uart_config_t uart_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
@@ -698,21 +802,27 @@ void app_main(void)
     uart_ll_set_baudrate(UART_LL_GET_HW(CONFIG_ESP_CONSOLE_UART_NUM), CONFIG_ESP_CONSOLE_UART_BAUDRATE);
 #endif
 #endif
+#endif
 
     /**
      * @brief Set the Wi-Fi radar configuration
      */
     esp_radar_csi_config_t csi_config = ESP_RADAR_CSI_CONFIG_DEFAULT();
     esp_radar_wifi_config_t wifi_config = ESP_RADAR_WIFI_CONFIG_DEFAULT();
-    esp_radar_espnow_config_t espnow_config = ESP_RADAR_ESPNOW_CONFIG_DEFAULT();
+    // esp_radar_espnow_config_t espnow_config = ESP_RADAR_ESPNOW_CONFIG_DEFAULT();
     esp_radar_dec_config_t dec_config = ESP_RADAR_DEC_CONFIG_DEFAULT();
     memcpy(csi_config.filter_mac, "\x1a\x00\x00\x00\x00\x00", 6);
     csi_config.csi_recv_interval = g_send_data_interval;
+    csi_config.csi_filtered_cb = wifi_csi_raw_cb; // 设置CSI数据回调函数
     dec_config.wifi_radar_cb     = wifi_radar_cb;
 #if WIFI_CSI_SEND_NULL_DATA_ENABLE
     csi_config.dump_ack_en       = true;
 #endif
     dec_config.outliers_threshold = 0;
+    
+    // 设置CSI输出类型为LLTF，确保系统能够正常检测
+    strcpy(g_console_input_config.csi_output_type, "LLTF");
+    strcpy(g_console_input_config.csi_output_format, "decimal");
     ESP_ERROR_CHECK(esp_radar_wifi_init(&wifi_config));
     ESP_ERROR_CHECK(esp_radar_csi_init(&csi_config));
     ESP_ERROR_CHECK(esp_radar_dec_init(&dec_config));
@@ -720,12 +830,23 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &wifi_event_handler, NULL));
 
+    // 配置默认WiFi连接
+    wifi_config_t sta_config = {0};
+    strcpy((char *)sta_config.sta.ssid, "xjhhsjbdhud985");
+    strcpy((char *)sta_config.sta.password, "ss559550");
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &sta_config));
+    ESP_ERROR_CHECK(esp_wifi_connect());
+    ESP_LOGI(TAG, "正在连接WiFi: xjhhsjbdhud985");
+
+#if ENABLE_CONSOLE_INPUT
     cmd_register_ping();
     cmd_register_system();
     cmd_register_wifi_config();
     cmd_register_wifi_scan();
     cmd_register_radar();
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
+#endif
 
     /**
      * @brief Start Wi-Fi radar
