@@ -529,21 +529,104 @@ static void wifi_radar_cb(void *ctx, const wifi_radar_info_t *info)
         s_last_radar_data_time = current_time;
     }
 
-    // 实时计算呼吸率
+    // ========== 自适应鲁棒呼吸率检测 ==========
+    // 使用滑动窗口 + 自相关分析 + 自适应阈值
+    #define BREATH_WINDOW_SIZE  60  // 约20秒数据 (每秒3个样本)
+    static float s_breath_jitter_buf[BREATH_WINDOW_SIZE] = {0};
+    static uint32_t s_breath_buf_idx = 0;
+    static uint32_t s_breath_sample_count = 0;
+    static float s_noise_floor = 0.0;      // 自适应噪声基底
+    static float s_breath_threshold = 0.0; // 自适应呼吸检测阈值
+    
+    // 更新抖动缓冲区
+    s_breath_jitter_buf[s_breath_buf_idx] = info->waveform_jitter;
+    s_breath_buf_idx = (s_breath_buf_idx + 1) % BREATH_WINDOW_SIZE;
+    if (s_breath_sample_count < BREATH_WINDOW_SIZE) {
+        s_breath_sample_count++;
+    }
+    
+    // 每秒更新一次噪声基底和呼吸率
+    static uint32_t s_breath_update_time = 0;
     float breath_rate = 0.0;
-    if (room_status) {
-        // 基于waveform_wander和waveform_jitter的组合计算呼吸率
-        // 根据采样数据调整系数，使其更准确反映实际呼吸率
-        breath_rate = (info->waveform_wander + info->waveform_jitter) * 600;
+    
+    if (current_time - s_breath_update_time >= 1000) {
+        s_breath_update_time = current_time;
         
-        // 屏住呼吸时显示为0
-        // 当waveform_wander和waveform_jitter都很小时，认为是屏住呼吸
-        if (info->waveform_wander < 0.001 && info->waveform_jitter < 0.001) {
-            breath_rate = 0.0;
-        } else {
-            // 限制呼吸率在合理范围内（10-60次/分钟）
-            if (breath_rate < 10) breath_rate = 10;
-            if (breath_rate > 60) breath_rate = 60;
+        if (s_breath_sample_count >= 20) {  // 至少20个样本
+            // 1. 计算当前窗口的统计特征
+            float sum = 0, sumsq = 0, max_val = 0, min_val = 1e9;
+            for (uint32_t i = 0; i < s_breath_sample_count; i++) {
+                sum += s_breath_jitter_buf[i];
+                sumsq += s_breath_jitter_buf[i] * s_breath_jitter_buf[i];
+                if (s_breath_jitter_buf[i] > max_val) max_val = s_breath_jitter_buf[i];
+                if (s_breath_jitter_buf[i] < min_val) min_val = s_breath_jitter_buf[i];
+            }
+            float mean = sum / s_breath_sample_count;
+            float variance = (sumsq / s_breath_sample_count) - (mean * mean);
+            float std_dev = (variance > 0) ? sqrtf(variance) : 0;
+            float range = max_val - min_val;
+            
+            // 2. 自适应更新噪声基底 (仅在无人或静止时)
+            if (!room_status || !human_status) {
+                s_noise_floor = s_noise_floor * 0.95 + mean * 0.05;  // 慢速更新
+            }
+            
+            // 3. 计算自适应阈值
+            s_breath_threshold = s_noise_floor + 2.0 * std_dev + 0.01;
+            
+            // 4. 检测呼吸信号是否存在
+            bool breath_detected = false;
+            if (room_status && (mean > s_breath_threshold)) {
+                // 使用自相关分析检测周期性
+                float max_corr = 0;
+                int best_lag = 0;
+                
+                // 搜索呼吸周期范围: 2-6秒 (对应5-30 BPM)
+                // 采样率约3Hz，周期约10-30个样本
+                for (int lag = 8; lag < 20 && lag < s_breath_sample_count/2; lag++) {
+                    float corr = 0;
+                    for (uint32_t i = 0; i < s_breath_sample_count - lag; i++) {
+                        float dx = s_breath_jitter_buf[i] - mean;
+                        float dy = s_breath_jitter_buf[i + lag] - mean;
+                        corr += dx * dy;
+                    }
+                    corr /= (s_breath_sample_count - lag);
+                    
+                    if (corr > max_corr) {
+                        max_corr = corr;
+                        best_lag = lag;
+                    }
+                }
+                
+                // 如果自相关显著 (相关性 > 0.3 * 方差)
+                if (max_corr > 0.3 * variance && best_lag > 0) {
+                    breath_detected = true;
+                    // 计算呼吸率: 采样率约3Hz, 周期best_lag个样本
+                    float period_sec = best_lag / 3.0f;
+                    breath_rate = 60.0f / period_sec;
+                    
+                    // 平滑呼吸率变化
+                    static float s_breath_rate_smooth = 0;
+                    breath_rate = s_breath_rate_smooth * 0.7f + breath_rate * 0.3f;
+                    s_breath_rate_smooth = breath_rate;
+                    
+                    // 限制范围
+                    if (breath_rate < 8) breath_rate = 8;
+                    if (breath_rate > 30) breath_rate = 30;
+                }
+            }
+            
+            // 5. 如果检测到大幅移动但不规则，使用经验公式估算
+            if (room_status && !breath_detected && range > 0.03) {
+                // 基于抖动幅度估算呼吸率 (经验公式)
+                breath_rate = mean * 500;  // 调整系数
+                if (breath_rate < 8) breath_rate = 8;
+                if (breath_rate > 30) breath_rate = 30;
+            }
+            
+            // 调试输出
+            ESP_LOGD(TAG, "呼吸检测: mean=%.4f, std=%.4f, range=%.4f, noise=%.4f, thresh=%.4f, rate=%.1f",
+                     mean, std_dev, range, s_noise_floor, s_breath_threshold, breath_rate);
         }
     }
     
